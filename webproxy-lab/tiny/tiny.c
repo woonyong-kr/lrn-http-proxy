@@ -137,6 +137,7 @@ void serve_static(int fd, char* filename, int filesize) {
   len = snprintf(buf, sizeof(buf),
                  "HTTP/1.0 200 OK\r\n"
                  "Server: Tiny Web Server\r\n"
+                 "Cache-Control: public, max-age=2\r\n"
                  "Content-length: %d\r\n"
                  "Content-type: %s\r\n"
                  "\r\n",
@@ -175,7 +176,8 @@ void serve_dynamic(int fd, char* filename, char* cgiargs) {
 
   len = snprintf(buf, sizeof(buf),
                  "HTTP/1.0 200 OK\r\n"
-                 "Server: Tiny Web Server\r\n");
+                 "Server: Tiny Web Server\r\n"
+                 "Cache-Control: public, max-age=2\r\n");
   Rio_writen(fd, buf, (size_t)len);
 
   if (Fork() == 0) {

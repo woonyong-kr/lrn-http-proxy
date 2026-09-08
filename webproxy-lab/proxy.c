@@ -1,505 +1,629 @@
+#define _GNU_SOURCE
+/* HTTP/1 GET forwarding with a bounded worker pool and conservative shared
+ * cache. The CS:APP RIO, socket helpers and the inherited LRU design remain the
+ * base. One request per connection; chunked messages are explicitly
+ * unsupported.
+ */
 #include "csapp.h"
-
+#include <limits.h>
+#include <math.h>
+#include <poll.h>
 #include <stdbool.h>
+#include <stdint.h>
 #include <strings.h>
+#include <time.h>
 
-/* 권장 캐시 크기와 객체 최대 크기 */
-#define MAX_CACHE_SIZE 1049000
-#define MAX_OBJECT_SIZE 102400
-#define CACHE_ENTRY_COUNT 16
-
-/* 이 긴 줄을 코드에 그대로 넣어도 스타일 점수는 깎이지 않습니다 */
-static const char *user_agent_hdr =
-    "User-Agent: Mozilla/5.0 (X11; Linux x86_64; rv:10.0.3) Gecko/20120305 "
-    "Firefox/10.0.3\r\n";
+#define CACHE_BYTES 1049000
+#define OBJECT_BYTES 102400
+#define ENTRIES 16
+#define HEADER_BYTES 32768
+#define QUEUE_SIZE 32
+#define MAX_WORKERS 32
 
 typedef struct {
-  int valid;
-  char uri[MAXLINE];
-  char *object;
+  char key[MAXLINE];
+  char *data;
   size_t size;
+  double expires;
+  double stored;
   unsigned long stamp;
-} cache_entry_t;
+  long age;
+} cache_entry;
+static cache_entry cache[ENTRIES];
+static size_t cache_bytes;
+static unsigned long cache_clock;
+static pthread_mutex_t cache_lock = PTHREAD_MUTEX_INITIALIZER;
+static int queue[QUEUE_SIZE], queue_head, queue_count;
+static pthread_mutex_t queue_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t queue_ready = PTHREAD_COND_INITIALIZER;
+static int timeout_ms = 2000;
 
-static cache_entry_t cache[CACHE_ENTRY_COUNT];
-static size_t cache_bytes_used = 0;
-static unsigned long cache_clock = 1;
-static pthread_mutex_t cache_mutex = PTHREAD_MUTEX_INITIALIZER;
-
-static void *thread(void *vargp);
-static void handle_client(int connfd);
-static int parse_uri(const char *uri, char *host, char *port, char *path);
-static void parse_host_header(const char *header, char *host, char *port);
-static int build_requesthdrs(rio_t *client_rio, const char *uri, char *host,
-                             char *port, char *path, char *request_hdr,
-                             size_t request_hdr_size, char *cache_key,
-                             size_t cache_key_size);
-static void clienterror(int fd, const char *cause, const char *errnum,
-                        const char *shortmsg, const char *longmsg);
-static ssize_t send_all(int fd, const void *buf, size_t n);
-static void cache_init(void);
-static bool cache_try_serve(int fd, const char *uri);
-static void cache_store(const char *uri, const char *buf, size_t size);
-static int cache_find_index_locked(const char *uri);
-static int cache_select_victim_locked(void);
-
-int main(int argc, char **argv) {
-  int listenfd;
-  pthread_t tid;
-
-  if (argc != 2) {
-    fprintf(stderr, "usage: %s <port>\n", argv[0]);
-    exit(1);
-  }
-
-  Signal(SIGPIPE, SIG_IGN);
-  cache_init();
-
-  listenfd = Open_listenfd(argv[1]);
-  while (1) {
-    int *connfdp = Malloc(sizeof(int));
-    *connfdp = Accept(listenfd, NULL, NULL);
-    Pthread_create(&tid, NULL, thread, connfdp);
-  }
+static double now(void) {
+  struct timespec t;
+  clock_gettime(CLOCK_MONOTONIC, &t);
+  return t.tv_sec + t.tv_nsec / 1e9;
 }
-
-static void *thread(void *vargp) {
-  int connfd = *((int *)vargp);
-
-  Free(vargp);
-  Pthread_detach(Pthread_self());
-  handle_client(connfd);
-  Close(connfd);
-  return NULL;
-}
-
-static void handle_client(int connfd) {
-  char buf[MAXLINE];
-  char method[MAXLINE];
-  char uri[MAXLINE];
-  char version[MAXLINE];
-  char host[MAXLINE];
-  char port[16];
-  char path[MAXLINE];
-  char request_hdr[MAXBUF];
-  char cache_key[MAXLINE];
-  char object_buf[MAX_OBJECT_SIZE];
-  rio_t client_rio;
-  rio_t server_rio;
-  int serverfd;
-  ssize_t n;
-  size_t total_size = 0;
-  bool cacheable = true;
-
-  rio_readinitb(&client_rio, connfd);
-  n = rio_readlineb(&client_rio, buf, MAXLINE);
-  if (n <= 0) {
-    return;
-  }
-
-  if (sscanf(buf, "%s %s %s", method, uri, version) != 3) {
-    clienterror(connfd, buf, "400", "Bad Request",
-                "Proxy could not parse the request line");
-    return;
-  }
-  (void)version;
-
-  if (strcasecmp(method, "GET")) {
-    clienterror(connfd, method, "501", "Not Implemented",
-                "Proxy only implements the GET method");
-    return;
-  }
-
-  if (parse_uri(uri, host, port, path) < 0) {
-    clienterror(connfd, uri, "400", "Bad Request",
-                "Proxy could not parse the URI");
-    return;
-  }
-
-  if (build_requesthdrs(&client_rio, uri, host, port, path, request_hdr,
-                        sizeof(request_hdr), cache_key,
-                        sizeof(cache_key)) < 0) {
-    clienterror(connfd, uri, "400", "Bad Request",
-                "Proxy could not build the request headers");
-    return;
-  }
-
-  if (cache_try_serve(connfd, cache_key)) {
-    return;
-  }
-
-  serverfd = open_clientfd(host, port);
-  if (serverfd < 0) {
-    clienterror(connfd, host, "502", "Bad Gateway",
-                "Proxy could not connect to the end server");
-    return;
-  }
-
-  if (send_all(serverfd, request_hdr, strlen(request_hdr)) < 0) {
-    Close(serverfd);
-    return;
-  }
-
-  rio_readinitb(&server_rio, serverfd);
-  while ((n = rio_readnb(&server_rio, buf, MAXBUF)) > 0) {
-    if (send_all(connfd, buf, (size_t)n) < 0) {
-      cacheable = false;
-      break;
-    }
-
-    if (cacheable && total_size + (size_t)n <= MAX_OBJECT_SIZE) {
-      memcpy(object_buf + total_size, buf, (size_t)n);
-    } else {
-      cacheable = false;
-    }
-    total_size += (size_t)n;
-  }
-
-  if (n == 0 && cacheable && total_size <= MAX_OBJECT_SIZE) {
-    cache_store(cache_key, object_buf, total_size);
-  }
-
-  Close(serverfd);
-}
-
-static int parse_uri(const char *uri, char *host, char *port, char *path) {
-  const char *hostbegin = uri;
-  const char *hostend;
-  const char *pathbegin;
-  const char *portbegin;
-  size_t hostlen;
-  size_t portlen;
-
-  host[0] = '\0';
-  strcpy(port, "80");
-  strcpy(path, "/");
-
-  if (!strncasecmp(uri, "http://", 7)) {
-    hostbegin = uri + 7;
-  } else if (!strncasecmp(uri, "https://", 8)) {
-    return -1;
-  } else if (uri[0] == '/') {
-    snprintf(path, MAXLINE, "%s", uri);
-    return 0;
-  }
-
-  pathbegin = strchr(hostbegin, '/');
-  if (pathbegin != NULL) {
-    snprintf(path, MAXLINE, "%s", pathbegin);
-    hostend = pathbegin;
-  } else {
-    hostend = hostbegin + strlen(hostbegin);
-  }
-
-  portbegin = memchr(hostbegin, ':', (size_t)(hostend - hostbegin));
-  if (portbegin != NULL) {
-    hostlen = (size_t)(portbegin - hostbegin);
-    portlen = (size_t)(hostend - portbegin - 1);
-    if (hostlen == 0 || portlen == 0 || hostlen >= MAXLINE || portlen >= 16) {
+static int send_all(int fd, const void *data, size_t n) {
+  const char *p = data;
+  while (n) {
+    ssize_t k = write(fd, p, n);
+    if (k < 0 && errno == EINTR)
+      continue;
+    if (k <= 0)
       return -1;
-    }
-    memcpy(host, hostbegin, hostlen);
-    host[hostlen] = '\0';
-    memcpy(port, portbegin + 1, portlen);
-    port[portlen] = '\0';
-  } else {
-    hostlen = (size_t)(hostend - hostbegin);
-    if (hostlen == 0 || hostlen >= MAXLINE) {
-      return -1;
-    }
-    memcpy(host, hostbegin, hostlen);
-    host[hostlen] = '\0';
+    p += k;
+    n -= (size_t)k;
   }
-
   return 0;
 }
-
-static void parse_host_header(const char *header, char *host, char *port) {
-  char value[MAXLINE];
-  char *start;
-  char *end;
-  char *colon;
-
-  snprintf(value, sizeof(value), "%s", header);
-  start = value + 5;
-  while (*start != '\0' && isspace((unsigned char)*start)) {
-    start++;
-  }
-
-  end = start + strlen(start);
-  while (end > start &&
-         (end[-1] == '\r' || end[-1] == '\n' || isspace((unsigned char)end[-1]))) {
-    end--;
-  }
-  *end = '\0';
-
-  colon = strchr(start, ':');
-  if (colon != NULL) {
-    *colon = '\0';
-    snprintf(host, MAXLINE, "%s", start);
-    snprintf(port, 16, "%s", colon + 1);
-  } else {
-    snprintf(host, MAXLINE, "%s", start);
-    strcpy(port, "80");
-  }
+static void error_reply(int fd, int status, const char *message) {
+  char reply[512];
+  int n = snprintf(reply, sizeof reply,
+                   "HTTP/1.0 %d %s\r\nConnection: close\r\nContent-Type: "
+                   "text/plain\r\nContent-Length: %zu\r\n\r\n%s",
+                   status, message, strlen(message), message);
+  if (n > 0 && (size_t)n < sizeof reply)
+    send_all(fd, reply, (size_t)n);
 }
-
-static int build_requesthdrs(rio_t *client_rio, const char *uri, char *host,
-                             char *port, char *path, char *request_hdr,
-                             size_t request_hdr_size, char *cache_key,
-                             size_t cache_key_size) {
-  char buf[MAXLINE];
-  char host_hdr[MAXLINE];
-  char other_hdrs[MAXBUF];
-  ssize_t n;
-  int len;
-
-  other_hdrs[0] = '\0';
-  while ((n = rio_readlineb(client_rio, buf, MAXLINE)) > 0) {
-    if (!strcmp(buf, "\r\n")) {
+static void set_timeouts(int fd) {
+  struct timeval t = {timeout_ms / 1000, (timeout_ms % 1000) * 1000};
+  setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &t, sizeof t);
+  setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &t, sizeof t);
+}
+static int connect_origin(const char *host, const char *port) {
+  struct addrinfo hints = {0}, *list, *p;
+  hints.ai_socktype = SOCK_STREAM;
+  if (getaddrinfo(host, port, &hints, &list))
+    return -1;
+  double deadline = now() + timeout_ms / 1000.0;
+  int fd = -1;
+  for (p = list; p && now() < deadline; p = p->ai_next) {
+    fd = socket(p->ai_family, p->ai_socktype, p->ai_protocol);
+    if (fd < 0)
+      continue;
+    int flags = fcntl(fd, F_GETFL, 0);
+    fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+    int result = connect(fd, p->ai_addr, p->ai_addrlen);
+    if (result < 0 && errno == EINPROGRESS) {
+      struct pollfd pollfd = {fd, POLLOUT, 0};
+      do {
+        int remaining = (int)((deadline - now()) * 1000);
+        result = poll(&pollfd, 1, remaining > 0 ? remaining : 0);
+      } while (result < 0 && errno == EINTR && now() < deadline);
+      int err = 0;
+      socklen_t length = sizeof err;
+      if (result > 0 &&
+          getsockopt(fd, SOL_SOCKET, SO_ERROR, &err, &length) == 0 && !err)
+        result = 0;
+      else {
+        if (result == 0)
+          errno = ETIMEDOUT;
+        result = -1;
+      }
+    }
+    if (result == 0) {
+      fcntl(fd, F_SETFL, flags);
+      set_timeouts(fd);
       break;
     }
-
-    if (!strncasecmp(buf, "Host:", 5)) {
-      if (host[0] == '\0') {
-        parse_host_header(buf, host, port);
-      }
-      continue;
-    }
-    if (!strncasecmp(buf, "User-Agent:", 11) ||
-        !strncasecmp(buf, "Connection:", 11) ||
-        !strncasecmp(buf, "Proxy-Connection:", 17)) {
-      continue;
-    }
-
-    if (strlen(other_hdrs) + strlen(buf) < sizeof(other_hdrs)) {
-      strcat(other_hdrs, buf);
-    }
+    close(fd);
+    fd = -1;
   }
-
-  if (n < 0 || host[0] == '\0') {
-    return -1;
-  }
-  if (path[0] == '\0') {
-    strcpy(path, "/");
-  }
-
-  if (!strcmp(port, "80")) {
-    len = snprintf(host_hdr, sizeof(host_hdr), "Host: %s\r\n", host);
-  } else {
-    len = snprintf(host_hdr, sizeof(host_hdr), "Host: %s:%s\r\n", host, port);
-  }
-  if (len < 0 || (size_t)len >= sizeof(host_hdr)) {
-    return -1;
-  }
-
-  len = snprintf(request_hdr, request_hdr_size,
-                 "GET %s HTTP/1.0\r\n"
-                 "%s"
-                 "%s"
-                 "Connection: close\r\n"
-                 "Proxy-Connection: close\r\n"
-                 "%s"
-                 "\r\n",
-                 path, host_hdr, user_agent_hdr, other_hdrs);
-  if (len < 0 || (size_t)len >= request_hdr_size) {
-    return -1;
-  }
-
-  len = snprintf(cache_key, cache_key_size, "http://%s:%s%s", host, port, path);
-  if (len < 0 || (size_t)len >= cache_key_size) {
-    return -1;
-  }
-
-  (void)uri;
-  return 0;
+  freeaddrinfo(list);
+  return fd;
 }
-
-static void clienterror(int fd, const char *cause, const char *errnum,
-                        const char *shortmsg, const char *longmsg) {
-  char buf[MAXBUF];
-  char body[MAXBUF];
-  int body_len;
-  int header_len;
-
-  body_len = snprintf(body, sizeof(body),
-                      "<html><title>Proxy Error</title>"
-                      "<body bgcolor=\"ffffff\">\r\n"
-                      "%s: %s\r\n"
-                      "<p>%s: %s\r\n"
-                      "<hr><em>CS:APP Proxy</em>\r\n",
-                      errnum, shortmsg, longmsg, cause);
-  if (body_len < 0) {
-    return;
-  }
-
-  header_len = snprintf(buf, sizeof(buf),
-                        "HTTP/1.0 %s %s\r\n"
-                        "Content-type: text/html\r\n"
-                        "Content-length: %d\r\n"
-                        "\r\n",
-                        errnum, shortmsg, body_len);
-  if (header_len < 0) {
-    return;
-  }
-
-  send_all(fd, buf, (size_t)header_len);
-  send_all(fd, body, (size_t)body_len);
-}
-
-static ssize_t send_all(int fd, const void *buf, size_t n) {
-  size_t nleft = n;
-  ssize_t nwritten;
-  const char *bufp = (const char *)buf;
-
-  while (nleft > 0) {
-    nwritten = write(fd, bufp, nleft);
-    if (nwritten < 0) {
-      if (errno == EINTR) {
-        continue;
-      }
-      return -1;
-    }
-    if (nwritten == 0) {
-      return -1;
-    }
-    nleft -= (size_t)nwritten;
-    bufp += nwritten;
-  }
-
-  return (ssize_t)n;
-}
-
-static void cache_init(void) {
-  int i;
-
-  for (i = 0; i < CACHE_ENTRY_COUNT; i++) {
-    cache[i].valid = 0;
-    cache[i].uri[0] = '\0';
-    cache[i].object = NULL;
-    cache[i].size = 0;
-    cache[i].stamp = 0;
-  }
-}
-
-static bool cache_try_serve(int fd, const char *uri) {
-  int index;
-  char *copy = NULL;
-  size_t size = 0;
-
-  pthread_mutex_lock(&cache_mutex);
-  index = cache_find_index_locked(uri);
-  if (index >= 0) {
-    size = cache[index].size;
-    if (size > 0) {
-      copy = Malloc(size);
-      memcpy(copy, cache[index].object, size);
-    }
-    cache[index].stamp = cache_clock++;
-  }
-  pthread_mutex_unlock(&cache_mutex);
-
-  if (index < 0) {
+static bool decimal(const char *s, long *value) {
+  if (!*s)
     return false;
+  for (const char *p = s; *p; p++)
+    if (*p < '0' || *p > '9')
+      return false;
+  errno = 0;
+  *value = strtol(s, NULL, 10);
+  return !errno && *value >= 0;
+}
+static char *trim(char *s) {
+  while (*s == ' ' || *s == '\t')
+    s++;
+  size_t n = strlen(s);
+  while (n && (s[n - 1] == ' ' || s[n - 1] == '\t' || s[n - 1] == '\r' ||
+               s[n - 1] == '\n'))
+    s[--n] = 0;
+  return s;
+}
+static int header_line(rio_t *rio, char *line, size_t size) {
+  ssize_t n = rio_readlineb(rio, line, size);
+  if (n <= 0)
+    return -1;
+  if (n < 2 || line[n - 2] != '\r' || line[n - 1] != '\n' ||
+      (size_t)n != strlen(line))
+    return -1;
+  return (int)n;
+}
+static bool split_header(char *line, char **name, char **value) {
+  char *colon = strchr(line, ':');
+  if (!colon || colon == line)
+    return false;
+  for (char *p = line; p < colon; p++) {
+    if (!(isalnum((unsigned char)*p) || strchr("!#$%&'*+-.^_`|~", *p)))
+      return false;
+    *p = (char)tolower((unsigned char)*p);
   }
-
-  if (size > 0) {
-    send_all(fd, copy, size);
-    Free(copy);
-  }
+  *colon = 0;
+  *name = line;
+  *value = trim(colon + 1);
+  for (char *p = *value; *p; p++)
+    if ((unsigned char)*p < 32 && *p != '\t')
+      return false;
   return true;
 }
-
-static void cache_store(const char *uri, const char *buf, size_t size) {
-  int i;
-  int victim;
-
-  if (size == 0 || size > MAX_OBJECT_SIZE) {
+static bool append_header(char *out, size_t *used, const char *name,
+                          const char *value) {
+  int n =
+      snprintf(out + *used, HEADER_BYTES - *used, "%s: %s\r\n", name, value);
+  if (n < 0 || (size_t)n >= HEADER_BYTES - *used)
+    return false;
+  *used += (size_t)n;
+  return true;
+}
+static bool parse_uri(const char *uri, char *host, char *port, char *path) {
+  if (strncmp(uri, "http://", 7))
+    return false;
+  const char *start = uri + 7, *end = strpbrk(start, "/?#");
+  if (!end)
+    end = start + strlen(start);
+  size_t n = (size_t)(end - start);
+  if (!n || n >= 512 || memchr(start, '@', n) || memchr(start, '[', n) ||
+      strchr(uri, '#'))
+    return false;
+  memcpy(host, start, n);
+  host[n] = 0;
+  char *colon = strchr(host, ':');
+  strcpy(port, "80");
+  if (colon) {
+    *colon++ = 0;
+    long number;
+    if (!decimal(colon, &number) || number < 1 || number > 65535)
+      return false;
+    snprintf(port, 16, "%ld", number);
+  }
+  if (!*host)
+    return false;
+  for (char *p = host; *p; p++) {
+    if (!isalnum((unsigned char)*p) && *p != '-' && *p != '.')
+      return false;
+    *p = (char)tolower((unsigned char)*p);
+  }
+  int result = snprintf(path, MAXLINE, "%s%s", *end == '/' ? "" : "/", end);
+  return result >= 0 && result < MAXLINE;
+}
+static void discard_entry(int i) {
+  cache_bytes -= cache[i].size;
+  free(cache[i].data);
+  memset(&cache[i], 0, sizeof cache[i]);
+}
+static int send_cached(int fd, const char *data, size_t size, long age) {
+  const char *end = strstr(data, "\r\n\r\n");
+  if (!end)
+    return -1;
+  size_t head = (size_t)(end - data) + 2;
+  char header[80];
+  int n = snprintf(header, sizeof header, "Age: %ld\r\n\r\n", age);
+  if (send_all(fd, data, head) || send_all(fd, header, (size_t)n))
+    return -1;
+  return send_all(fd, data + head + 2, size - head - 2);
+}
+static bool cache_serve(int fd, const char *key) {
+  char *copy = NULL;
+  size_t size = 0;
+  long age = 0;
+  pthread_mutex_lock(&cache_lock);
+  for (int i = 0; i < ENTRIES; i++) {
+    if (cache[i].data && cache[i].expires <= now())
+      discard_entry(i);
+    if (cache[i].data && !strcmp(cache[i].key, key)) {
+      size = cache[i].size;
+      copy = malloc(size + 1);
+      if (copy) {
+        memcpy(copy, cache[i].data, size + 1);
+        age = cache[i].age + (long)(now() - cache[i].stored);
+        cache[i].stamp = ++cache_clock;
+      }
+      break;
+    }
+  }
+  pthread_mutex_unlock(&cache_lock);
+  if (!copy)
+    return false;
+  send_cached(fd, copy, size, age);
+  free(copy);
+  fprintf(stderr, "cache HIT %s\n", key);
+  return true;
+}
+static void cache_store(const char *key, const char *data, size_t size,
+                        double expires, long age) {
+  if (size > OBJECT_BYTES || expires <= now())
+    return;
+  char *copy = malloc(size + 1);
+  if (!copy)
+    return;
+  memcpy(copy, data, size);
+  copy[size] = 0;
+  pthread_mutex_lock(&cache_lock);
+  int slot = -1;
+  for (int i = 0; i < ENTRIES; i++)
+    if (cache[i].data && !strcmp(cache[i].key, key))
+      discard_entry(i);
+  for (;;) {
+    int victim = -1;
+    for (int i = 0; i < ENTRIES; i++) {
+      if (!cache[i].data)
+        slot = i;
+      else if (victim < 0 || cache[i].stamp < cache[victim].stamp)
+        victim = i;
+    }
+    if (slot >= 0 && cache_bytes + size <= CACHE_BYTES)
+      break;
+    if (victim < 0)
+      break;
+    discard_entry(victim);
+  }
+  if (slot >= 0) {
+    cache[slot] = (cache_entry){.data = copy,
+                                .size = size,
+                                .expires = expires,
+                                .stored = now(),
+                                .stamp = ++cache_clock,
+                                .age = age};
+    snprintf(cache[slot].key, MAXLINE, "%s", key);
+    cache_bytes += size;
+  } else
+    free(copy);
+  pthread_mutex_unlock(&cache_lock);
+}
+static void handle_client(int fd) {
+  rio_t client;
+  rio_readinitb(&client, fd);
+  char line[MAXLINE], method[32], uri[MAXLINE], version[32], extra;
+  char host[512], port[16], path[MAXLINE], key[MAXLINE];
+  char headers[HEADER_BYTES] = "";
+  size_t used = 0, read_total = 0;
+  bool cacheable = true, host_seen = false;
+  if (header_line(&client, line, sizeof line) < 0)
+    return;
+  if (sscanf(line, "%31s %8191s %31s %c", method, uri, version, &extra) != 3) {
+    error_reply(fd, 400, "Bad Request");
     return;
   }
-
-  pthread_mutex_lock(&cache_mutex);
-
-  i = cache_find_index_locked(uri);
-  if (i >= 0) {
-    cache_bytes_used -= cache[i].size;
-    Free(cache[i].object);
-    cache[i].object = NULL;
-    cache[i].size = 0;
-    cache[i].valid = 0;
+  if (strcmp(method, "GET")) {
+    error_reply(fd, 501, "GET Only");
+    return;
   }
-
-  while (cache_bytes_used + size > MAX_CACHE_SIZE) {
-    victim = cache_select_victim_locked();
-    if (victim < 0) {
+  if ((strcmp(version, "HTTP/1.0") && strcmp(version, "HTTP/1.1")) ||
+      !parse_uri(uri, host, port, path)) {
+    error_reply(fd, 400, "Unsupported Request Target");
+    return;
+  }
+  for (;;) {
+    int n = header_line(&client, line, sizeof line);
+    if (n < 0 || (read_total += (size_t)n) > HEADER_BYTES) {
+      error_reply(fd, 400, "Invalid Headers");
+      return;
+    }
+    if (!strcmp(line, "\r\n"))
       break;
+    char *name, *value;
+    if (!split_header(line, &name, &value)) {
+      error_reply(fd, 400, "Invalid Header");
+      return;
     }
-    cache_bytes_used -= cache[victim].size;
-    Free(cache[victim].object);
-    cache[victim].object = NULL;
-    cache[victim].size = 0;
-    cache[victim].valid = 0;
-    cache[victim].uri[0] = '\0';
-    cache[victim].stamp = 0;
-  }
-
-  victim = -1;
-  for (i = 0; i < CACHE_ENTRY_COUNT; i++) {
-    if (!cache[i].valid) {
-      victim = i;
-      break;
-    }
-  }
-  if (victim < 0) {
-    victim = cache_select_victim_locked();
-    if (victim >= 0) {
-      cache_bytes_used -= cache[victim].size;
-      Free(cache[victim].object);
-      cache[victim].object = NULL;
-      cache[victim].size = 0;
-      cache[victim].valid = 0;
-      cache[victim].uri[0] = '\0';
-      cache[victim].stamp = 0;
-    }
-  }
-
-  if (victim >= 0) {
-    cache[victim].object = Malloc(size);
-    memcpy(cache[victim].object, buf, size);
-    snprintf(cache[victim].uri, sizeof(cache[victim].uri), "%s", uri);
-    cache[victim].size = size;
-    cache[victim].stamp = cache_clock++;
-    cache[victim].valid = 1;
-    cache_bytes_used += size;
-  }
-
-  pthread_mutex_unlock(&cache_mutex);
-}
-
-static int cache_find_index_locked(const char *uri) {
-  int i;
-
-  for (i = 0; i < CACHE_ENTRY_COUNT; i++) {
-    if (cache[i].valid && !strcmp(cache[i].uri, uri)) {
-      return i;
-    }
-  }
-  return -1;
-}
-
-static int cache_select_victim_locked(void) {
-  int i;
-  int victim = -1;
-  unsigned long oldest = 0;
-
-  for (i = 0; i < CACHE_ENTRY_COUNT; i++) {
-    if (!cache[i].valid) {
+    if (!strcmp(name, "host")) {
+      if (host_seen) {
+        error_reply(fd, 400, "Duplicate Host");
+        return;
+      }
+      host_seen = true;
       continue;
     }
-    if (victim < 0 || cache[i].stamp < oldest) {
-      victim = i;
-      oldest = cache[i].stamp;
+    if (!strcmp(name, "transfer-encoding") || !strcmp(name, "expect") ||
+        !strcmp(name, "upgrade") || !strcmp(name, "trailer")) {
+      error_reply(fd, 400, "Unsupported Framing");
+      return;
+    }
+    if (!strcmp(name, "content-length")) {
+      long size;
+      if (!decimal(value, &size) || size) {
+        error_reply(fd, 400, "GET Body Unsupported");
+        return;
+      }
+      continue;
+    }
+    if (!strcmp(name, "connection") || !strcmp(name, "proxy-connection")) {
+      if (strcasecmp(value, "close") && strcasecmp(value, "keep-alive")) {
+        error_reply(fd, 400, "Unsupported Connection Options");
+        return;
+      }
+      continue;
+    }
+    if (!strcmp(name, "keep-alive") || !strcmp(name, "te") ||
+        !strcmp(name, "proxy-authorization"))
+      continue;
+    if (!strcmp(name, "authorization") || !strcmp(name, "cookie") ||
+        !strcmp(name, "range") || !strncmp(name, "if-", 3) ||
+        !strcmp(name, "cache-control") || !strcmp(name, "pragma"))
+      cacheable = false;
+    if (!append_header(headers, &used, name, value)) {
+      error_reply(fd, 431, "Headers Too Large");
+      return;
     }
   }
-  return victim;
+  if (!strcmp(version, "HTTP/1.1") && !host_seen) {
+    error_reply(fd, 400, "Host Required");
+    return;
+  }
+  int k = snprintf(key, sizeof key, "http://%s:%s%s", host, port, path);
+  if (k < 0 || (size_t)k >= sizeof key) {
+    error_reply(fd, 414, "URI Too Long");
+    return;
+  }
+  if (cacheable && cache_serve(fd, key))
+    return;
+  fprintf(stderr, "cache MISS %s\n", key);
+  int origin = connect_origin(host, port);
+  if (origin < 0) {
+    error_reply(fd, errno == ETIMEDOUT ? 504 : 502, "Origin Unavailable");
+    return;
+  }
+  char first[MAXLINE + 1024];
+  k = snprintf(first, sizeof first,
+               "GET %s HTTP/1.0\r\nHost: %s:%s\r\nConnection: close\r\n", path,
+               host, port);
+  if (send_all(origin, first, (size_t)k) || send_all(origin, headers, used) ||
+      send_all(origin, "\r\n", 2)) {
+    close(origin);
+    error_reply(fd, 502, "Origin Write Failed");
+    return;
+  }
+  double response_start = now();
+  rio_t upstream;
+  rio_readinitb(&upstream, origin);
+  if (header_line(&upstream, line, sizeof line) < 0) {
+    close(origin);
+    error_reply(fd, 504, "Origin Timeout");
+    return;
+  }
+  int status;
+  char response_version[32];
+  if (sscanf(line, "%31s %d", response_version, &status) != 2 ||
+      (strcmp(response_version, "HTTP/1.0") &&
+       strcmp(response_version, "HTTP/1.1")) ||
+      status < 200 || status > 599) {
+    close(origin);
+    error_reply(fd, 502, "Invalid Origin Status");
+    return;
+  }
+  used =
+      (size_t)snprintf(headers, sizeof headers,
+                       "HTTP/1.0 %d Response\r\nConnection: close\r\n", status);
+  long length = -1, max_age = -1, age = 0;
+  bool public_response = false, control_seen = false, valid = true,
+       age_seen = false;
+  double date_age = 0;
+  bool date_seen = false;
+  read_total = 0;
+  while (valid) {
+    int n = header_line(&upstream, line, sizeof line);
+    if (n < 0 || (read_total += (size_t)n) > HEADER_BYTES) {
+      valid = false;
+      break;
+    }
+    if (!strcmp(line, "\r\n"))
+      break;
+    char *name, *value;
+    if (!split_header(line, &name, &value)) {
+      valid = false;
+      break;
+    }
+    if (!strcmp(name, "transfer-encoding")) {
+      valid = false;
+      break;
+    }
+    if (!strcmp(name, "content-length")) {
+      if (length >= 0 || !decimal(value, &length)) {
+        valid = false;
+        break;
+      }
+    }
+    if (!strcmp(name, "date")) {
+      struct tm tm = {0};
+      char *end = strptime(value, "%a, %d %b %Y %H:%M:%S GMT", &tm);
+      if (date_seen || !end || *end)
+        cacheable = false;
+      else {
+        double apparent = difftime(time(NULL), timegm(&tm));
+        if (apparent > 0)
+          date_age = apparent;
+      }
+      date_seen = true;
+    }
+    if (!strcmp(name, "age")) {
+      if (age_seen || !decimal(value, &age)) {
+        valid = false;
+        break;
+      }
+      age_seen = true;
+      continue;
+    }
+    if (!strcmp(name, "connection")) {
+      if (strcasecmp(value, "close") && strcasecmp(value, "keep-alive")) {
+        valid = false;
+        break;
+      }
+      continue;
+    }
+    if (!strcmp(name, "keep-alive") || !strcmp(name, "proxy-connection"))
+      continue;
+    if (!strcmp(name, "set-cookie") || !strcmp(name, "vary") ||
+        !strcmp(name, "www-authenticate") || !strcmp(name, "pragma"))
+      cacheable = false;
+    if (!strcmp(name, "cache-control")) {
+      if (control_seen)
+        cacheable = false;
+      control_seen = true;
+      char copy[MAXLINE];
+      snprintf(copy, sizeof copy, "%s", value);
+      char *save, *token = strtok_r(copy, ",", &save);
+      while (token) {
+        token = trim(token);
+        if (!strcasecmp(token, "public"))
+          public_response = true;
+        else if (!strncasecmp(token, "max-age=", 8)) {
+          if (max_age >= 0 || !decimal(token + 8, &max_age))
+            cacheable = false;
+        } else
+          cacheable =
+              false; /* unknown/revalidation/private directives bypass */
+        token = strtok_r(NULL, ",", &save);
+      }
+    }
+    if (!append_header(headers, &used, name, value))
+      valid = false;
+  }
+  if (!valid) {
+    close(origin);
+    error_reply(fd, 502, "Unsupported Origin Message");
+    return;
+  }
+  if (used + 2 >= sizeof headers) {
+    close(origin);
+    error_reply(fd, 502, "Origin Headers Too Large");
+    return;
+  }
+  memcpy(headers + used, "\r\n", 3);
+  used += 2;
+  cacheable = cacheable && status == 200 && public_response && max_age > age &&
+              max_age <= 86400 && length >= 0;
+  double corrected_age = fmax(date_age, (double)age) + (now() - response_start);
+  double expires = now() + (double)max_age - corrected_age;
+  age = (long)fmin(corrected_age, (double)LONG_MAX - 1024);
+  char object[OBJECT_BYTES + 1];
+  size_t total = used;
+  if (used > OBJECT_BYTES)
+    cacheable = false;
+  if (cacheable)
+    memcpy(object, headers, used);
+  /* Forward the original age; cache hits add their residence time. */
+  char age_header[80];
+  k = snprintf(age_header, sizeof age_header, "Age: %ld\r\n\r\n", age);
+  if (send_all(fd, headers, used - 2) || send_all(fd, age_header, (size_t)k)) {
+    close(origin);
+    return;
+  }
+  long remaining = length;
+  ssize_t n = 0;
+  while (remaining != 0) {
+    size_t want =
+        remaining < 0 || remaining > MAXBUF ? MAXBUF : (size_t)remaining;
+    n = rio_readnb(&upstream, line, want);
+    if (n <= 0)
+      break;
+    if (send_all(fd, line, (size_t)n)) {
+      cacheable = false;
+      break;
+    }
+    if (cacheable && total + (size_t)n <= OBJECT_BYTES)
+      memcpy(object + total, line, (size_t)n);
+    else
+      cacheable = false;
+    total += (size_t)n;
+    if (remaining > 0)
+      remaining -= n;
+  }
+  close(origin);
+  if (cacheable && remaining == 0)
+    cache_store(key, object, total, expires, age);
+}
+static void *worker(void *unused) {
+  (void)unused;
+  for (;;) {
+    pthread_mutex_lock(&queue_lock);
+    while (!queue_count)
+      pthread_cond_wait(&queue_ready, &queue_lock);
+    int fd = queue[queue_head];
+    queue_head = (queue_head + 1) % QUEUE_SIZE;
+    queue_count--;
+    pthread_mutex_unlock(&queue_lock);
+    set_timeouts(fd);
+    handle_client(fd);
+    close(fd);
+  }
+  return NULL;
+}
+int main(int argc, char **argv) {
+  if (argc != 2) {
+    fprintf(stderr, "usage: %s <port>\n", argv[0]);
+    return 1;
+  }
+  int workers = 8;
+  long parsed;
+  const char *value = getenv("PROXY_TIMEOUT_MS");
+  if (value) {
+    if (!decimal(value, &parsed) || parsed < 50 || parsed > 60000)
+      return 1;
+    timeout_ms = (int)parsed;
+  }
+  value = getenv("PROXY_WORKERS");
+  if (value) {
+    if (!decimal(value, &parsed) || parsed < 1 || parsed > MAX_WORKERS)
+      return 1;
+    workers = (int)parsed;
+  }
+  signal(SIGPIPE, SIG_IGN);
+  long port_number;
+  if (!decimal(argv[1], &port_number) || port_number < 1 || port_number > 65535)
+    return 1;
+  int listenfd = socket(AF_INET, SOCK_STREAM, 0);
+  if (listenfd < 0)
+    return 1;
+  int reuse = 1;
+  setsockopt(listenfd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof reuse);
+  struct sockaddr_in address = {0};
+  address.sin_family = AF_INET;
+  address.sin_port = htons((uint16_t)port_number);
+  address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+  if (bind(listenfd, (struct sockaddr *)&address, sizeof address) < 0 ||
+      listen(listenfd, QUEUE_SIZE) < 0) {
+    close(listenfd);
+    return 1;
+  }
+  for (int i = 0; i < workers; i++) {
+    pthread_t tid;
+    if (pthread_create(&tid, NULL, worker, NULL))
+      return 1;
+    pthread_detach(tid);
+  }
+  fprintf(stderr,
+          "GET proxy workers=%d queue=%d timeout_ms=%d cache_bytes=%d "
+          "object_bytes=%d\n",
+          workers, QUEUE_SIZE, timeout_ms, CACHE_BYTES, OBJECT_BYTES);
+  for (;;) {
+    int fd = accept(listenfd, NULL, NULL);
+    if (fd < 0) {
+      if (errno == EINTR)
+        continue;
+      break;
+    }
+    pthread_mutex_lock(&queue_lock);
+    if (queue_count == QUEUE_SIZE) {
+      pthread_mutex_unlock(&queue_lock);
+      close(fd);
+      continue;
+    }
+    queue[(queue_head + queue_count) % QUEUE_SIZE] = fd;
+    queue_count++;
+    pthread_cond_signal(&queue_ready);
+    pthread_mutex_unlock(&queue_lock);
+  }
+  close(listenfd);
+  return 0;
 }

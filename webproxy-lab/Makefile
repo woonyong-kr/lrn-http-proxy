@@ -6,7 +6,7 @@
 
 CC = gcc
 CFLAGS = -g -Wall
-LDFLAGS = -lpthread
+LDFLAGS = -lpthread -lm
 OS = $(shell uname -s)
 ARCH = $(shell uname -m)
 PLATFORM = $(OS)-$(ARCH)
