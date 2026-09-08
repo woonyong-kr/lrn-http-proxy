@@ -6,6 +6,7 @@ import os
 from pathlib import Path
 import socket
 import subprocess
+import tempfile
 import threading
 import time
 import unittest
@@ -69,6 +70,24 @@ def free_port():
         return s.getsockname()[1]
 
 
+def wait_ready(proc, port, diagnostics):
+    # Startup can be delayed on a busy machine; readiness has its own deadline.
+    # This is only startup readiness; request timeout tests still use 300 ms.
+    deadline = time.monotonic() + 10
+    while True:
+        try:
+            with socket.create_connection(("127.0.0.1", port), timeout=0.1):
+                return
+        except OSError as error:
+            status = proc.poll()
+            if status is not None or time.monotonic() > deadline:
+                diagnostics.seek(0)
+                raise RuntimeError(
+                    f"Server not ready: exit={status}, stderr={diagnostics.read()!r}"
+                ) from error
+            time.sleep(0.01)
+
+
 @contextmanager
 def servers():
     COUNTS.clear()
@@ -76,26 +95,20 @@ def servers():
     thread = threading.Thread(target=origin.serve_forever, daemon=True)
     thread.start()
     port = free_port()
+    diagnostics = tempfile.TemporaryFile(mode="w+")
     proc = subprocess.Popen(
         [str(ROOT / "webproxy-lab/proxy"), str(port)],
         env={**os.environ, "PROXY_TIMEOUT_MS": "300", "PROXY_WORKERS": "4"},
         stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
+        stderr=diagnostics,
     )
     try:
-        deadline = time.monotonic() + 5
-        while True:
-            try:
-                with socket.create_connection(("127.0.0.1", port), timeout=0.1):
-                    break
-            except OSError:
-                if proc.poll() is not None or time.monotonic() > deadline:
-                    raise RuntimeError("proxy did not start")
-                time.sleep(0.01)
+        wait_ready(proc, port, diagnostics)
         yield port, origin.server_port
     finally:
         proc.terminate()
         proc.wait(timeout=5)
+        diagnostics.close()
         origin.shutdown()
         origin.server_close()
         thread.join()
@@ -183,22 +196,15 @@ class ProxyTests(unittest.TestCase):
 
     def test_tiny_server_static_file(self):
         port = free_port()
+        diagnostics = tempfile.TemporaryFile(mode="w+")
         proc = subprocess.Popen(
             [str(ROOT / "webproxy-lab/tiny/tiny"), str(port)],
             cwd=ROOT / "webproxy-lab/tiny",
             stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
+            stderr=diagnostics,
         )
         try:
-            deadline = time.monotonic() + 3
-            while True:
-                try:
-                    with socket.create_connection(("127.0.0.1", port), timeout=0.1):
-                        break
-                except OSError:
-                    if time.monotonic() > deadline:
-                        raise
-                    time.sleep(0.01)
+            wait_ready(proc, port, diagnostics)
             expected = (ROOT / "webproxy-lab/tiny/home.html").read_bytes()
             for _ in range(2):
                 response = request(self.proxy, port, "/home.html")
@@ -206,6 +212,7 @@ class ProxyTests(unittest.TestCase):
         finally:
             proc.terminate()
             proc.wait(timeout=3)
+            diagnostics.close()
 
     def test_parallel_responses_and_repeated_disconnects(self):
         with concurrent.futures.ThreadPoolExecutor(max_workers=12) as pool:

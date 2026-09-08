@@ -18,7 +18,7 @@ make -C webproxy-lab run-tiny TINY_PORT=8000
 curl --noproxy '' -x http://127.0.0.1:8080 http://127.0.0.1:8000/home.html
 ```
 
-대화형 서버는 해당 터미널에서 Ctrl-C로 종료한다. demo/test의 자식 프로세스는 실행기가 보유한 PID 또는 컨테이너 ID로만 종료한다. 다른 서버를 포트 번호로 찾아 일괄 종료하지 않는다. 준비된 Python 환경이 없으면 먼저 `make setup`을 실행한다.
+서버는 Ctrl-C로 종료한다. demo/test는 자신이 만든 프로세스만 종료한다.
 
 ## 입력에서 출력까지
 
@@ -46,6 +46,8 @@ DNS 조회 자체는 OS resolver를 따르며 TCP connect deadline에 포함하�
 
 캐시 기준은 [RFC 9111](https://www.rfc-editor.org/rfc/rfc9111.html)의 freshness/age 개념을 제한적으로 구현한다. RFC 전체 적합성을 주장하지 않는다.
 
-## 원본·학습 문서의 경계
+## 출처와 기여
 
-[원본 아카이브와 기여 구분](archive/README.md)을 확인한다. 이 저장소는 실행 코드·테스트·사용법·설계 근거를 소유한다. WIKI는 개념 정본을 소유하며 기존 정본·공통 색인·배포 파일을 이 작업에서 수정하지 않는다. SQL·PintOS와 RepoLM/음성 서비스는 이 프로그램의 실행 의존성이 아니다.
+[woonyong-kr/SW_AI-W08-webproxy_lab](https://github.com/woonyong-kr/SW_AI-W08-webproxy_lab)에서 이어 받은 학습용 파생본이다. 기준 원본 revision은 `964163c7583369819af422968fcd2540b8e37e23`이다. 원본 과제·팀 코드와 이후 개인 확장을 구분하며, 개별 기여는 Git author와 diff로 확인한다. 기존 저작권 표시는 소스에 유지한다.
+
+과거 문서·실험·기여 기록은 [정리 전 이력](https://github.com/woonyong-kr/lrn-http-proxy/tree/0580e06a40163a42e70b18d065f47687ed9f53bf)에서 확인할 수 있다. 실행법과 지원 계약은 이 README에 모았다. 개념·설계·실험 해석 자료는 개인 WIKI inbox에서 검토한 뒤 기존 정본에 흡수한다.
