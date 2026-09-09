@@ -49,6 +49,6 @@ DNS 조회 자체는 OS resolver를 따르며 TCP connect deadline에 포함하�
 
 ## 출처와 기여
 
-[woonyong-kr/SW_AI-W08-webproxy_lab](https://github.com/woonyong-kr/SW_AI-W08-webproxy_lab)에서 이어 받은 학습용 파생본이다. 기준 원본 revision은 `964163c7583369819af422968fcd2540b8e37e23`이다. 원본 과제·팀 코드와 이후 개인 확장을 구분하며, 개별 기여는 Git author와 diff로 확인한다. 기존 저작권 표시는 소스에 유지한다.
+원본 `woonyong-kr/SW_AI-W08-webproxy_lab`의 `964163c7583369819af422968fcd2540b8e37e23`에서 이어 받은 학습용 파생본이다. 원본 과제·팀 코드와 이후 개인 확장은 Git author와 diff로 구분하며, 기존 저작권 표시는 소스에 유지한다. 원본 주소의 공개 접근이 제한돼 있어 자료는 아래 이력 링크로 확인할 수 있다.
 
 이 파생본에서는 worker 수와 timeout에 상한을 두고, 캐시 가능한 응답과 거절할 메시지 형식을 좁혔다. 이전 Echo·Tiny·프록시 실습 자료는 [정리 전 이력](https://github.com/woonyong-kr/lrn-http-proxy/tree/0580e06a40163a42e70b18d065f47687ed9f53bf)에 남아 있다.
