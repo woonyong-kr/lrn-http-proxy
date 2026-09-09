@@ -1,6 +1,6 @@
 # lrn-http-proxy
 
-HTTP GET을 중계하는 동시성 캐시 프록시. 핵심 엔진을 실제 입력으로 실행하고 결과와 내부 동작을 확인하는 독립 프로그램이다.
+클라이언트의 HTTP GET을 원본 서버로 중계하고, 재사용할 수 있는 작은 응답을 메모리에 보관하는 C 프록시다. 같은 파일을 반복 요청하면서 원본 서버에 실제로 몇 번 접근했는지, 응답이 만료되면 어떻게 달라지는지 확인할 수 있다.
 
 ## 실행
 
@@ -8,7 +8,6 @@ macOS/Linux의 C compiler·make·Python 3가 필요하다.
 
 ```sh
 make setup
-make test
 make demo
 # 터미널 1: 프록시
 make serve
@@ -30,13 +29,15 @@ curl --noproxy '' -x http://127.0.0.1:8080 http://127.0.0.1:8000/home.html
 
 Tiny의 정적 파일은 `public, max-age=2`를 표시한다. 자동 테스트용 Python origin은 요청 횟수를 세어 hit·miss·expiry를 독립적으로 확인한다. `make demo` 출력은 MISS 1 → HIT 1 → EXPIRED 2다. stderr에는 key별 HIT/MISS가 나온다.
 
-구현을 읽는 순서: `webproxy-lab/proxy.c`, `webproxy-lab/tiny/tiny.c`, `tests/test_proxy.py`.
+연결·중계·캐시는 [`proxy.c`](webproxy-lab/proxy.c), 정적 파일을 제공하는 Tiny 서버는 [`tiny.c`](webproxy-lab/tiny/tiny.c)에 있다. 요청 횟수를 세는 검증용 원본 서버는 [`test_proxy.py`](tests/test_proxy.py)에 들어 있다.
 
 ## 검증과 관찰
 
-실제 TCP 통합 테스트로 인증·cookie 우회, cache 용량과 LRU, hit/miss/만료, 큰 응답, 원본 조기 종료, timeout, framing 거절, 동시 요청·반복 연결 종료, Tiny 정적 파일 중계를 검증한다.
+```sh
+make test
+```
 
-실행 환경·명령·exit code·원본 백업과 전체 결과는 이번 전환의 별도 작업 폴더에 기록한다. 새 기계에서는 같은 명령으로 직접 재검증한다. 수치가 기록되어 있다는 사실과 현재 실행 성공을 구분한다.
+실제 TCP 연결로 캐시 hit·miss·만료와 LRU 퇴출을 검사한다. 인증·쿠키가 있는 요청의 캐시 우회, 큰 응답, 원본의 조기 종료, timeout, 지원하지 않는 framing과 동시 연결도 다룬다. `make demo`의 원본 요청 횟수는 첫 요청에서 1, 캐시 hit에서 1, 만료 후에는 2가 된다.
 
 ## 지원 범위와 한계
 
@@ -50,4 +51,4 @@ DNS 조회 자체는 OS resolver를 따르며 TCP connect deadline에 포함하�
 
 [woonyong-kr/SW_AI-W08-webproxy_lab](https://github.com/woonyong-kr/SW_AI-W08-webproxy_lab)에서 이어 받은 학습용 파생본이다. 기준 원본 revision은 `964163c7583369819af422968fcd2540b8e37e23`이다. 원본 과제·팀 코드와 이후 개인 확장을 구분하며, 개별 기여는 Git author와 diff로 확인한다. 기존 저작권 표시는 소스에 유지한다.
 
-과거 문서·실험·기여 기록은 [정리 전 이력](https://github.com/woonyong-kr/lrn-http-proxy/tree/0580e06a40163a42e70b18d065f47687ed9f53bf)에서 확인할 수 있다. 실행법과 지원 계약은 이 README에 모았다. 개념·설계·실험 해석 자료는 개인 WIKI inbox에서 검토한 뒤 기존 정본에 흡수한다.
+이 파생본에서는 worker 수와 timeout에 상한을 두고, 캐시 가능한 응답과 거절할 메시지 형식을 좁혔다. 이전 Echo·Tiny·프록시 실습 자료는 [정리 전 이력](https://github.com/woonyong-kr/lrn-http-proxy/tree/0580e06a40163a42e70b18d065f47687ed9f53bf)에 남아 있다.
